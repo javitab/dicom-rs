@@ -20,6 +20,8 @@ pub fn run_store_sync(scu_stream: TcpStream, args: &App) -> Result<(), Whatever>
         out_dir,
         port: _,
         non_blocking: _,
+        status_url: _,
+        status_auth: _,
     } = args;
     let verbose = *verbose;
 

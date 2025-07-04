@@ -52,6 +52,12 @@ struct App {
     /// Run in non-blocking mode (spins up an async task to handle each incoming stream)
     #[arg(short, long)]
     non_blocking: bool,
+    /// HTTP URL to send DICOM status updates to
+    #[arg(long, default_value = "")]
+    status_url: String,
+    /// Authorization header value for HTTP status updates (e.g., "Bearer token123")
+    #[arg(long)]
+    status_auth: Option<String>,
 }
 
 fn create_cstore_response(

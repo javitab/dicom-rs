@@ -1,12 +1,39 @@
 use dicom_dictionary_std::tags;
+use dicom_dictionary_std::StandardSopClassDictionary;
+use dicom_core::dictionary::{UidDictionary, UidDictionaryEntry};
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use dicom_ul::{pdu::PDataValueType, Pdu};
 use snafu::{OptionExt, Report, ResultExt, Whatever};
 use tracing::{debug, info, warn};
+use serde::Serialize;
 
 use crate::{create_cecho_response, create_cstore_response, transfer::ABSTRACT_SYNTAXES, App};
+
+fn translate_sop_class_uid(sop_class_uid: &str) -> String {
+    let dict = StandardSopClassDictionary;
+    if let Some(entry) = dict.by_uid(sop_class_uid) {
+        entry.name().to_string()
+    } else {
+        // Fall back to the UID if not found in dictionary
+        sop_class_uid.to_string()
+    }
+}
+
+#[derive(Serialize)]
+struct DicomStatus {
+    sop_instance_uid: String,
+    sop_class_uid: String,
+    sop_class: String,
+    study_instance_uid: String,
+    series_instance_uid: String,
+    patient_id: Option<String>,
+    study_accession_number: Option<String>,
+    status: String,
+    message: Option<String>,
+    file_path: Option<String>,
+}
 pub async fn run_store_async(
     scu_stream: tokio::net::TcpStream,
     args: &App,
@@ -21,13 +48,15 @@ pub async fn run_store_async(
         out_dir,
         port: _,
         non_blocking: _,
+        status_url,
+        status_auth,
     } = args;
     let verbose = *verbose;
 
     let mut instance_buffer: Vec<u8> = Vec::with_capacity(1024 * 1024);
     let mut msgid = 1;
-    let mut sop_class_uid = "".to_string();
-    let mut sop_instance_uid = "".to_string();
+    let mut sop_class_uid = String::new();
+    let mut sop_instance_uid = String::new();
 
     let mut options = dicom_ul::association::ServerAssociationOptions::new()
         .accept_any()
@@ -144,8 +173,7 @@ pub async fn run_store_async(
                                         )?
                                         .to_string();
                                 }
-                                instance_buffer.clear();
-                            } else if data_value.value_type == PDataValueType::Data
+                                instance_buffer.clear();                            } else if data_value.value_type == PDataValueType::Data
                                 && data_value.is_last
                             {
                                 instance_buffer.append(&mut data_value.data);
@@ -157,40 +185,54 @@ pub async fn run_store_async(
                                     .whatever_context("missing presentation context")?;
                                 let ts = &presentation_context.transfer_syntax;
 
-                                let obj = InMemDicomObject::read_dataset_with_ts(
-                                    instance_buffer.as_slice(),
-                                    TransferSyntaxRegistry.get(ts).unwrap(),
-                                )
-                                .whatever_context("failed to read DICOM data object")?;
-                                let file_meta = FileMetaTableBuilder::new()
-                                    .media_storage_sop_class_uid(
-                                        obj.element(tags::SOP_CLASS_UID)
-                                            .whatever_context("missing SOP Class UID")?
-                                            .to_str()
-                                            .whatever_context("could not retrieve SOP Class UID")?,
-                                    )
-                                    .media_storage_sop_instance_uid(
-                                        obj.element(tags::SOP_INSTANCE_UID)
-                                            .whatever_context("missing SOP Instance UID")?
-                                            .to_str()
-                                            .whatever_context("missing SOP Instance UID")?,
-                                    )
-                                    .transfer_syntax(ts)
-                                    .build()
-                                    .whatever_context(
-                                        "failed to build DICOM meta file information",
-                                    )?;
-                                let file_obj = obj.with_exact_meta(file_meta);
-
-                                // write the files to the current directory with their SOPInstanceUID as filenames
-                                let mut file_path = out_dir.clone();
-                                file_path.push(
-                                    sop_instance_uid.trim_end_matches('\0').to_string() + ".dcm",
-                                );
-                                file_obj
-                                    .write_to_file(&file_path)
-                                    .whatever_context("could not save DICOM object to file")?;
-                                info!("Stored {}", file_path.display());
+                                // Process the DICOM object and handle errors
+                                let (file_path_opt, study_uid_opt, series_uid_opt, patient_id_opt, accession_opt, error_msg_opt) = match process_dicom_instance(
+                                    &instance_buffer,
+                                    ts,
+                                    &sop_class_uid,
+                                    &sop_instance_uid,
+                                    out_dir,
+                                ).await {
+                                    Ok((file_path, study_uid, series_uid, patient_id, accession_number)) => {
+                                        info!("Stored {}", file_path.display());
+                                        (Some(file_path), Some(study_uid), Some(series_uid), patient_id, accession_number, None)
+                                    }
+                                    Err(_) => {
+                                        let error_msg = "Failed to process DICOM instance".to_string();
+                                        warn!("{}", error_msg);
+                                        (None, None, None, None, None, Some(error_msg))
+                                    }
+                                };
+                                
+                                // Send HTTP status update
+                                let status = if let Some(file_path) = file_path_opt {
+                                    DicomStatus {
+                                        sop_instance_uid: sop_instance_uid.trim_end_matches('\0').to_string(),
+                                        sop_class_uid: sop_class_uid.clone(),
+                                        sop_class: translate_sop_class_uid(&sop_class_uid),
+                                        study_instance_uid: study_uid_opt.unwrap().trim_end_matches('\0').to_string(),
+                                        series_instance_uid: series_uid_opt.unwrap().trim_end_matches('\0').to_string(),
+                                        patient_id: patient_id_opt,
+                                        study_accession_number: accession_opt,
+                                        status: "success".to_string(),
+                                        message: Some("DICOM instance stored successfully".to_string()),
+                                        file_path: Some(file_path.to_string_lossy().to_string()),
+                                    }
+                                } else {
+                                    DicomStatus {
+                                        sop_instance_uid: sop_instance_uid.trim_end_matches('\0').to_string(),
+                                        sop_class_uid: sop_class_uid.clone(),
+                                        sop_class: translate_sop_class_uid(&sop_class_uid),
+                                        study_instance_uid: "unknown".to_string(),
+                                        series_instance_uid: "unknown".to_string(),
+                                        patient_id: None,
+                                        study_accession_number: None,
+                                        status: "failed".to_string(),
+                                        message: error_msg_opt,
+                                        file_path: None,
+                                    }
+                                };
+                                send_dicom_status(status, status_url, status_auth.as_deref(), verbose).await;
 
                                 // send C-STORE-RSP object
                                 // commands are always in implicit VR LE
@@ -270,4 +312,151 @@ pub async fn run_store_async(
     }
 
     Ok(())
+}
+
+async fn send_dicom_status(status: DicomStatus, url: &str, auth_header: Option<&str>, verbose: bool) {
+    // Always display JSON in verbose mode, regardless of whether we send HTTP request
+    if verbose {
+        match serde_json::to_string_pretty(&status) {
+            Ok(json_content) => {
+                info!("DICOM status JSON:\n{}", json_content);
+            }
+            Err(e) => {
+                warn!("Failed to serialize status for logging: {}", e);
+            }
+        }
+    }
+
+    // Only send HTTP request if URL is provided and not empty
+    if url.is_empty() {
+        if verbose {
+            info!("No status URL provided, skipping HTTP request");
+        }
+        return;
+    }
+
+    if verbose {
+        info!("Sending HTTP POST to: {}", url);
+        if auth_header.is_some() {
+            info!("Using authorization header");
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let mut request = client.post(url).json(&status);
+    
+    // Add authorization header if provided
+    if let Some(auth) = auth_header {
+        request = request.header("Authorization", auth);
+    }
+
+    match request.send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                if verbose {
+                    info!("HTTP POST successful - Status: {}, SOP Instance UID: {}", 
+                          response.status(), status.sop_instance_uid);
+                } else {
+                    debug!("Successfully sent status update for SOP Instance UID: {}", status.sop_instance_uid);
+                }
+            } else {
+                warn!("Failed to send status update, HTTP status: {}", response.status());
+                if verbose {
+                    if let Ok(body) = response.text().await {
+                        warn!("HTTP response body: {}", body);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to send status update: {}", e);
+            if verbose {
+                warn!("HTTP request details - URL: {}, Error: {}", url, e);
+            }
+        }
+    }
+}
+
+async fn process_dicom_instance(
+    instance_buffer: &[u8],
+    ts: &str,
+    _sop_class_uid: &str,
+    sop_instance_uid: &str,
+    out_dir: &std::path::PathBuf,
+) -> Result<(std::path::PathBuf, String, String, Option<String>, Option<String>), Whatever> {
+    let obj = InMemDicomObject::read_dataset_with_ts(
+        instance_buffer,
+        TransferSyntaxRegistry.get(ts).unwrap(),
+    )
+    .whatever_context("failed to read DICOM data object")?;
+
+    // Extract study and series instance UIDs from the DICOM object
+    let study_instance_uid = obj
+        .element(tags::STUDY_INSTANCE_UID)
+        .whatever_context("missing Study Instance UID")?
+        .to_str()
+        .whatever_context("could not retrieve Study Instance UID")?
+        .to_string();
+    
+    let series_instance_uid = obj
+        .element(tags::SERIES_INSTANCE_UID)
+        .whatever_context("missing Series Instance UID")?
+        .to_str()
+        .whatever_context("could not retrieve Series Instance UID")?
+        .to_string();
+
+    // Extract patient ID and study accession number from the original object
+    let patient_id = obj
+        .element(tags::PATIENT_ID)
+        .ok()
+        .and_then(|elem| elem.to_str().ok())
+        .map(|s| s.trim_end_matches('\0').to_string())
+        .filter(|s| !s.is_empty());
+    
+    let study_accession_number = obj
+        .element(tags::ACCESSION_NUMBER)
+        .ok()
+        .and_then(|elem| elem.to_str().ok())
+        .map(|s| s.trim_end_matches('\0').to_string())
+        .filter(|s| !s.is_empty());
+
+    let file_meta = FileMetaTableBuilder::new()
+        .media_storage_sop_class_uid(
+            obj.element(tags::SOP_CLASS_UID)
+                .whatever_context("missing SOP Class UID")?
+                .to_str()
+                .whatever_context("could not retrieve SOP Class UID")?,
+        )
+        .media_storage_sop_instance_uid(
+            obj.element(tags::SOP_INSTANCE_UID)
+                .whatever_context("missing SOP Instance UID")?
+                .to_str()
+                .whatever_context("missing SOP Instance UID")?,
+        )
+        .transfer_syntax(ts)
+        .build()
+        .whatever_context("failed to build DICOM meta file information")?;
+    
+    let file_obj = obj.with_exact_meta(file_meta);
+
+    // Create the directory structure and file path
+    let mut file_path = out_dir.clone();
+    file_path.push(format!(
+        "{}/{}/{}.dcm",
+        study_instance_uid.trim_end_matches('\0'),
+        series_instance_uid.trim_end_matches('\0'),
+        sop_instance_uid.trim_end_matches('\0')
+    ));
+    
+    // Ensure the directory exists
+    if let Some(parent_dir) = file_path.parent() {
+        std::fs::create_dir_all(parent_dir)
+            .whatever_context("failed to create directory structure")?;
+    }
+    
+    file_obj
+        .write_to_file(&file_path)
+        .whatever_context("could not save DICOM object to file")?;
+
+    Ok((file_path, study_instance_uid, series_instance_uid, patient_id, study_accession_number))
 }
