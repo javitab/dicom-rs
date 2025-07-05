@@ -1,6 +1,7 @@
 use dicom_dictionary_std::tags;
 use dicom_dictionary_std::StandardSopClassDictionary;
 use dicom_core::dictionary::{UidDictionary, UidDictionaryEntry};
+use dicom_core::header::Header;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
@@ -8,6 +9,7 @@ use dicom_ul::{pdu::PDataValueType, Pdu};
 use snafu::{OptionExt, Report, ResultExt, Whatever};
 use tracing::{debug, info, warn};
 use serde::Serialize;
+use chrono::{DateTime, Utc};
 
 use crate::{create_cecho_response, create_cstore_response, transfer::ABSTRACT_SYNTAXES, App};
 
@@ -23,6 +25,7 @@ fn translate_sop_class_uid(sop_class_uid: &str) -> String {
 
 #[derive(Serialize)]
 struct DicomStatus {
+    timestamp: DateTime<Utc>,
     sop_instance_uid: String,
     sop_class_uid: String,
     sop_class: String,
@@ -52,6 +55,7 @@ pub async fn run_store_async(
         status_auth,
         status_no_auth,
         status_insecure,
+        show_details,
     } = args;
     let verbose = *verbose;
 
@@ -194,6 +198,7 @@ pub async fn run_store_async(
                                     &sop_class_uid,
                                     &sop_instance_uid,
                                     out_dir,
+                                    *show_details,
                                 ).await {
                                     Ok((file_path, study_uid, series_uid, patient_id, accession_number)) => {
                                         info!("Stored {}", file_path.display());
@@ -209,6 +214,7 @@ pub async fn run_store_async(
                                 // Send HTTP status update
                                 let status = if let Some(file_path) = file_path_opt {
                                     DicomStatus {
+                                        timestamp: Utc::now(),
                                         sop_instance_uid: sop_instance_uid.trim_end_matches('\0').to_string(),
                                         sop_class_uid: sop_class_uid.clone(),
                                         sop_class: translate_sop_class_uid(&sop_class_uid),
@@ -222,6 +228,7 @@ pub async fn run_store_async(
                                     }
                                 } else {
                                     DicomStatus {
+                                        timestamp: Utc::now(),
                                         sop_instance_uid: sop_instance_uid.trim_end_matches('\0').to_string(),
                                         sop_class_uid: sop_class_uid.clone(),
                                         sop_class: translate_sop_class_uid(&sop_class_uid),
@@ -404,6 +411,7 @@ async fn process_dicom_instance(
     _sop_class_uid: &str,
     sop_instance_uid: &str,
     out_dir: &std::path::PathBuf,
+    show_details: bool,
 ) -> Result<(std::path::PathBuf, String, String, Option<String>, Option<String>), Whatever> {
     let obj = InMemDicomObject::read_dataset_with_ts(
         instance_buffer,
@@ -440,6 +448,11 @@ async fn process_dicom_instance(
         .and_then(|elem| elem.to_str().ok())
         .map(|s| s.trim_end_matches('\0').to_string())
         .filter(|s| !s.is_empty());
+
+    // Print detailed DICOM object information if requested
+    if show_details {
+        print_dicom_details(&obj, sop_instance_uid);
+    }
 
     let file_meta = FileMetaTableBuilder::new()
         .media_storage_sop_class_uid(
@@ -480,4 +493,39 @@ async fn process_dicom_instance(
         .whatever_context("could not save DICOM object to file")?;
 
     Ok((file_path, study_instance_uid, series_instance_uid, patient_id, study_accession_number))
+}
+
+fn print_dicom_details(obj: &InMemDicomObject, sop_instance_uid: &str) {
+    // Print basic information
+    info!("SOP Instance UID: {}", sop_instance_uid);
+    if let Ok(elem) = obj.element(tags::PATIENT_ID) {
+        if let Ok(patient_id) = elem.to_str() {
+            info!("Patient ID: {}", patient_id);
+        }
+    }
+    if let Ok(elem) = obj.element(tags::STUDY_INSTANCE_UID) {
+        if let Ok(study_uid) = elem.to_str() {
+            info!("Study Instance UID: {}", study_uid);
+        }
+    }
+    if let Ok(elem) = obj.element(tags::SERIES_INSTANCE_UID) {
+        if let Ok(series_uid) = elem.to_str() {
+            info!("Series Instance UID: {}", series_uid);
+        }
+    }
+    if let Ok(elem) = obj.element(tags::ACCESSION_NUMBER) {
+        if let Ok(accession_number) = elem.to_str() {
+            info!("Study Accession Number: {}", accession_number);
+        }
+    }
+
+    // Print all elements in the dataset
+    info!("DICOM Object Details:");
+    for elem in obj.iter() {
+        let tag = elem.tag();
+        let vr = elem.vr();
+        let value = elem.value();
+        
+        info!("{} ({}): {:?}", tag, vr, value);
+    }
 }

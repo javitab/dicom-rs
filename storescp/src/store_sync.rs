@@ -24,6 +24,7 @@ pub fn run_store_sync(scu_stream: TcpStream, args: &App) -> Result<(), Whatever>
         status_auth: _,
         status_no_auth: _,
         status_insecure: _,
+        show_details: _,
     } = args;
     let verbose = *verbose;
 

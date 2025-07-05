@@ -64,6 +64,9 @@ struct App {
     /// Disable SSL certificate verification for HTTP status updates (use with caution)
     #[arg(long)]
     status_insecure: bool,
+    /// Print detailed DICOM object information for each stored instance
+    #[arg(long)]
+    show_details: bool,
 }
 
 fn create_cstore_response(
