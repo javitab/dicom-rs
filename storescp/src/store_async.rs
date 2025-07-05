@@ -50,6 +50,8 @@ pub async fn run_store_async(
         non_blocking: _,
         status_url,
         status_auth,
+        status_no_auth,
+        status_insecure,
     } = args;
     let verbose = *verbose;
 
@@ -232,7 +234,7 @@ pub async fn run_store_async(
                                         file_path: None,
                                     }
                                 };
-                                send_dicom_status(status, status_url, status_auth.as_deref(), verbose).await;
+                                send_dicom_status(status, status_url, status_auth.as_deref(), *status_no_auth, *status_insecure, verbose).await;
 
                                 // send C-STORE-RSP object
                                 // commands are always in implicit VR LE
@@ -314,7 +316,7 @@ pub async fn run_store_async(
     Ok(())
 }
 
-async fn send_dicom_status(status: DicomStatus, url: &str, auth_header: Option<&str>, verbose: bool) {
+async fn send_dicom_status(status: DicomStatus, url: &str, auth_header: Option<&str>, no_auth: bool, insecure: bool, verbose: bool) {
     // Always display JSON in verbose mode, regardless of whether we send HTTP request
     if verbose {
         match serde_json::to_string_pretty(&status) {
@@ -337,17 +339,36 @@ async fn send_dicom_status(status: DicomStatus, url: &str, auth_header: Option<&
 
     if verbose {
         info!("Sending HTTP POST to: {}", url);
-        if auth_header.is_some() {
+        if !no_auth && auth_header.is_some() {
             info!("Using authorization header");
+        } else if no_auth {
+            info!("Authentication disabled for this request");
+        }
+        if insecure {
+            info!("SSL certificate verification disabled");
         }
     }
 
-    let client = reqwest::Client::new();
+    // Create HTTP client with optional SSL verification
+    let client = if insecure {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_else(|e| {
+                warn!("Failed to create insecure HTTP client, falling back to secure: {}", e);
+                reqwest::Client::new()
+            })
+    } else {
+        reqwest::Client::new()
+    };
+    
     let mut request = client.post(url).json(&status);
     
-    // Add authorization header if provided
-    if let Some(auth) = auth_header {
-        request = request.header("Authorization", auth);
+    // Add authorization header if provided and not disabled
+    if !no_auth {
+        if let Some(auth) = auth_header {
+            request = request.header("Authorization", auth);
+        }
     }
 
     match request.send().await {

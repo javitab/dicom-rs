@@ -52,12 +52,18 @@ struct App {
     /// Run in non-blocking mode (spins up an async task to handle each incoming stream)
     #[arg(short, long)]
     non_blocking: bool,
-    /// HTTP URL to send DICOM status updates to
+    /// HTTP URL to send DICOM status updates to (requires --status-auth or --status-no-auth)
     #[arg(long, default_value = "")]
     status_url: String,
-    /// Authorization header value for HTTP status updates (e.g., "Bearer token123")
+    /// Authorization header value for HTTP status updates (required and non-empty if status-url is provided, e.g., "Bearer token123")
     #[arg(long)]
     status_auth: Option<String>,
+    /// Disable authentication requirement for HTTP status updates (allows empty or no auth header)
+    #[arg(long)]
+    status_no_auth: bool,
+    /// Disable SSL certificate verification for HTTP status updates (use with caution)
+    #[arg(long)]
+    status_insecure: bool,
 }
 
 fn create_cstore_response(
@@ -110,6 +116,21 @@ fn create_cecho_response(message_id: u16) -> InMemDicomObject<StandardDataDictio
 
 fn main() {
     let app = App::parse();
+    
+    // Validate that status_auth is provided and not empty if status_url is not empty (unless status_no_auth is set)
+    if !app.status_url.is_empty() && !app.status_no_auth {
+        if app.status_auth.is_none() {
+            error!("--status-auth is required when --status-url is provided (or use --status-no-auth to disable authentication)");
+            std::process::exit(-1);
+        }
+        if let Some(ref auth) = app.status_auth {
+            if auth.is_empty() {
+                error!("--status-auth cannot be empty when --status-url is provided (or use --status-no-auth to disable authentication)");
+                std::process::exit(-1);
+            }
+        }
+    }
+    
     if app.non_blocking {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
