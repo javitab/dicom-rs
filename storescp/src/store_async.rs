@@ -31,11 +31,11 @@ struct DicomStatus {
     sop_class: String,
     study_instance_uid: String,
     series_instance_uid: String,
-    patient_id: Option<String>,
-    study_accession_number: Option<String>,
+    patient_id: String,
+    study_accession_number: String,
     status: String,
-    message: Option<String>,
-    file_path: Option<String>,
+    message: String,
+    file_path: String,
 }
 pub async fn run_store_async(
     scu_stream: tokio::net::TcpStream,
@@ -63,6 +63,12 @@ pub async fn run_store_async(
     let mut msgid = 1;
     let mut sop_class_uid = String::new();
     let mut sop_instance_uid = String::new();
+    
+    // Track last instance information for association close
+    let mut last_study_uid = String::new();
+    let mut last_series_uid = String::new();
+    let mut last_patient_id = String::new();
+    let mut last_accession_number = String::new();
 
     let mut options = dicom_ul::association::ServerAssociationOptions::new()
         .accept_any()
@@ -97,6 +103,22 @@ pub async fn run_store_async(
         "> Presentation contexts: {:?}",
         association.presentation_contexts()
     );
+
+    // Send association opened status
+    let association_opened_status = DicomStatus {
+        timestamp: Utc::now(),
+        sop_instance_uid: String::new(),
+        sop_class_uid: String::new(),
+        sop_class: String::new(),
+        study_instance_uid: String::new(),
+        series_instance_uid: String::new(),
+        patient_id: String::new(),
+        study_accession_number: String::new(),
+        status: "association_opened".to_string(),
+        message: format!("Association opened from {}", association.client_ae_title()),
+        file_path: String::new(),
+    };
+    send_dicom_status(association_opened_status, status_url, status_auth.as_deref(), *status_no_auth, *status_insecure, verbose).await;
 
     loop {
         match association.receive().await {
@@ -202,6 +224,11 @@ pub async fn run_store_async(
                                 ).await {
                                     Ok((file_path, study_uid, series_uid, patient_id, accession_number)) => {
                                         info!("Stored {}", file_path.display());
+                                        // Update last instance information for association close
+                                        last_study_uid = study_uid.clone();
+                                        last_series_uid = series_uid.clone();
+                                        last_patient_id = patient_id.clone().unwrap_or_default();
+                                        last_accession_number = accession_number.clone().unwrap_or_default();
                                         (Some(file_path), Some(study_uid), Some(series_uid), patient_id, accession_number, None)
                                     }
                                     Err(_) => {
@@ -220,11 +247,11 @@ pub async fn run_store_async(
                                         sop_class: translate_sop_class_uid(&sop_class_uid),
                                         study_instance_uid: study_uid_opt.unwrap().trim_end_matches('\0').to_string(),
                                         series_instance_uid: series_uid_opt.unwrap().trim_end_matches('\0').to_string(),
-                                        patient_id: patient_id_opt,
-                                        study_accession_number: accession_opt,
+                                        patient_id: patient_id_opt.unwrap_or_default(),
+                                        study_accession_number: accession_opt.unwrap_or_default(),
                                         status: "success".to_string(),
-                                        message: Some("DICOM instance stored successfully".to_string()),
-                                        file_path: Some(file_path.to_string_lossy().to_string()),
+                                        message: "DICOM instance stored successfully".to_string(),
+                                        file_path: file_path.to_string_lossy().to_string(),
                                     }
                                 } else {
                                     DicomStatus {
@@ -234,11 +261,11 @@ pub async fn run_store_async(
                                         sop_class: translate_sop_class_uid(&sop_class_uid),
                                         study_instance_uid: "unknown".to_string(),
                                         series_instance_uid: "unknown".to_string(),
-                                        patient_id: None,
-                                        study_accession_number: None,
+                                        patient_id: String::new(),
+                                        study_accession_number: String::new(),
                                         status: "failed".to_string(),
-                                        message: error_msg_opt,
-                                        file_path: None,
+                                        message: error_msg_opt.unwrap_or_default(),
+                                        file_path: String::new(),
                                     }
                                 };
                                 send_dicom_status(status, status_url, status_auth.as_deref(), *status_no_auth, *status_insecure, verbose).await;
@@ -286,25 +313,95 @@ pub async fn run_store_async(
                             "Released association with {}",
                             association.client_ae_title()
                         );
+
+                        // Send association closed status with last instance information
+                        let association_closed_status = DicomStatus {
+                            timestamp: Utc::now(),
+                            sop_instance_uid: sop_instance_uid.trim_end_matches('\0').to_string(),
+                            sop_class_uid: sop_class_uid.clone(),
+                            sop_class: translate_sop_class_uid(&sop_class_uid),
+                            study_instance_uid: last_study_uid.clone(),
+                            series_instance_uid: last_series_uid.clone(),
+                            patient_id: last_patient_id.clone(),
+                            study_accession_number: last_accession_number.clone(),
+                            status: "association_closed".to_string(),
+                            message: format!("Association closed with {}", association.client_ae_title()),
+                            file_path: String::new(),
+                        };
+                        send_dicom_status(association_closed_status, status_url, status_auth.as_deref(), *status_no_auth, *status_insecure, verbose).await;
+                        
                         break;
                     }
                     Pdu::AbortRQ { source } => {
                         warn!("Aborted connection from: {:?}", source);
+
+                        // Send association closed status with last instance information
+                        let association_closed_status = DicomStatus {
+                            timestamp: Utc::now(),
+                            sop_instance_uid: sop_instance_uid.trim_end_matches('\0').to_string(),
+                            sop_class_uid: sop_class_uid.clone(),
+                            sop_class: translate_sop_class_uid(&sop_class_uid),
+                            study_instance_uid: last_study_uid.clone(),
+                            series_instance_uid: last_series_uid.clone(),
+                            patient_id: last_patient_id.clone(),
+                            study_accession_number: last_accession_number.clone(),
+                            status: "association_aborted".to_string(),
+                            message: format!("Association aborted from: {:?}", source),
+                            file_path: String::new(),
+                        };
+                        send_dicom_status(association_closed_status, status_url, status_auth.as_deref(), *status_no_auth, *status_insecure, verbose).await;
+
                         break;
                     }
                     _ => {}
                 }
             }
             Err(err @ dicom_ul::association::server::Error::Receive { .. }) => {
-                if verbose {
-                    info!("{}", Report::from_error(err));
+                let error_message = if verbose {
+                    format!("{}", Report::from_error(&err))
                 } else {
-                    info!("{}", err);
-                }
+                    format!("{}", &err)
+                };
+                info!("{}", error_message);
+
+                // Send association closed status with last instance information
+                let association_closed_status = DicomStatus {
+                    timestamp: Utc::now(),
+                    sop_instance_uid: sop_instance_uid.trim_end_matches('\0').to_string(),
+                    sop_class_uid: sop_class_uid.clone(),
+                    sop_class: translate_sop_class_uid(&sop_class_uid),
+                    study_instance_uid: last_study_uid.clone(),
+                    series_instance_uid: last_series_uid.clone(),
+                    patient_id: last_patient_id.clone(),
+                    study_accession_number: last_accession_number.clone(),
+                    status: "association_error".to_string(),
+                    message: format!("Association ended due to receive error: {}", error_message),
+                    file_path: String::new(),
+                };
+                send_dicom_status(association_closed_status, status_url, status_auth.as_deref(), *status_no_auth, *status_insecure, verbose).await;
+
                 break;
             }
             Err(err) => {
-                warn!("Unexpected error: {}", Report::from_error(err));
+                let error_report = Report::from_error(&err);
+                warn!("Unexpected error: {}", error_report);
+
+                // Send association closed status with last instance information
+                let association_closed_status = DicomStatus {
+                    timestamp: Utc::now(),
+                    sop_instance_uid: sop_instance_uid.trim_end_matches('\0').to_string(),
+                    sop_class_uid: sop_class_uid.clone(),
+                    sop_class: translate_sop_class_uid(&sop_class_uid),
+                    study_instance_uid: last_study_uid.clone(),
+                    series_instance_uid: last_series_uid.clone(),
+                    patient_id: last_patient_id.clone(),
+                    study_accession_number: last_accession_number.clone(),
+                    status: "association_error".to_string(),
+                    message: format!("Association ended due to unexpected error: {}", error_report),
+                    file_path: String::new(),
+                };
+                send_dicom_status(association_closed_status, status_url, status_auth.as_deref(), *status_no_auth, *status_insecure, verbose).await;
+
                 break;
             }
         }
